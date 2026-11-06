@@ -10,7 +10,7 @@ import pytest
 
 from kleinanzeigen_bot import publishing_form
 from kleinanzeigen_bot.utils import page_scripts
-from kleinanzeigen_bot.utils.web_scraping_mixin import WebScrapingMixin
+from kleinanzeigen_bot.utils.web_scraping_mixin import By, WebScrapingMixin
 
 pytestmark = [pytest.mark.itest, pytest.mark.slow, pytest.mark.asyncio(loop_scope = "session")]
 
@@ -107,3 +107,15 @@ async def test_condition_trigger_reports_missing_label(web:WebScrapingMixin, sho
     """Without a condition label there is nothing to mark."""
     await show_html('<button aria-haspopup="dialog">Bitte wählen</button>')
     assert json.loads(await web.web_execute(page_scripts.call("condition_dialog_trigger"))) == {"found": False}
+
+
+@pytest.mark.parametrize(("body", "expected"), [
+    pytest.param('<button id="x"><span class="shrink-0" aria-hidden="true"><svg></svg></span><span class="flex-1">Auto, Rad &amp; Boot</span>'
+                 '<svg></svg><span class="sr-only">, öffnet Unterkategorien</span></button>', "Auto, Rad & Boot", id = "folder"),
+    pytest.param('<button id="x" aria-pressed="false"><span class="flex-1">Nintendo Switch</span></button>', "Nintendo Switch", id = "leaf"),
+])
+async def test_category_choice_label_drops_screen_reader_suffix(web:WebScrapingMixin, show_html:ShowHtml, body:str, expected:str) -> None:
+    """Choice names are read without the sr-only suffix, which selection-based text returns instead of the name."""
+    await show_html(body)
+    button = await web.web_find(By.ID, "x")
+    assert await publishing_form._category_choice_label(web, button) == expected

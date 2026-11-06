@@ -14,13 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kleinanzeigen_bot import LOG, publishing_submission
+from kleinanzeigen_bot import LOG, publishing_form, publishing_submission, resources
 from kleinanzeigen_bot.app import KleinanzeigenBot
 from kleinanzeigen_bot.model.ad_model import Ad, AdUpdateStrategy
 from kleinanzeigen_bot.model.config_model import PublishingConfig
 from kleinanzeigen_bot.publishing_form import (
     _category_dialog_label_options,  # noqa: PLC2701
     _category_label_match_score,  # noqa: PLC2701
+    _category_with_dialog_sublevel,  # noqa: PLC2701
     _click_category_dialog_level,  # noqa: PLC2701
     _select_button_combobox,  # noqa: PLC2701 - needed for coverage of React fiber selection
     _set_category_in_dialog,  # noqa: PLC2701
@@ -43,6 +44,7 @@ from kleinanzeigen_bot.publishing_form import (
     set_special_attributes,
     upload_images,
 )
+from kleinanzeigen_bot.utils import dicts
 from kleinanzeigen_bot.utils.exceptions import CategoryResolutionError, PageScriptError
 from kleinanzeigen_bot.utils.web_scraping_mixin import By, Element
 
@@ -940,6 +942,11 @@ class TestCategorySuggestionPicker:
         label_elem.click.assert_awaited_once()
 
 
+def _visible_text_label(_web:object, button:Element) -> str:
+    """Stand-in for ``_category_choice_label`` that reads the label a test stored on its mock button."""
+    return str(getattr(button, "visible_text", ""))
+
+
 class TestRedesignedCategoryDialog:
     """Regression coverage for the visible-label category dialog."""
 
@@ -980,6 +987,7 @@ class TestRedesignedCategoryDialog:
         with (
             patch.object(test_bot, "web_find_all", new_callable = AsyncMock, return_value = buttons),
             patch.object(test_bot, "extract_visible_text", new_callable = AsyncMock, side_effect = visible_text),
+            patch.object(publishing_form, "_category_choice_label", new_callable = AsyncMock, side_effect = _visible_text_label),
             pytest.raises(CategoryResolutionError, match = "no unique match"),
         ):
             await _click_category_dialog_level(
@@ -1017,6 +1025,7 @@ class TestRedesignedCategoryDialog:
         with (
             patch.object(test_bot, "web_find_all", new_callable = AsyncMock, side_effect = find_all),
             patch.object(test_bot, "extract_visible_text", new_callable = AsyncMock, side_effect = visible_text),
+            patch.object(publishing_form, "_category_choice_label", new_callable = AsyncMock, side_effect = _visible_text_label),
             patch.object(test_bot, "web_sleep", new_callable = AsyncMock),
             pytest.raises(CategoryResolutionError, match = "did not select the requested leaf"),
         ):
@@ -1114,6 +1123,7 @@ class TestRedesignedCategoryDialog:
             patch.object(test_bot, "web_probe", new_callable = AsyncMock, side_effect = probe),
             patch.object(test_bot, "web_find_all", new_callable = AsyncMock, side_effect = find_all),
             patch.object(test_bot, "extract_visible_text", new_callable = AsyncMock, side_effect = visible_text),
+            patch.object(publishing_form, "_category_choice_label", new_callable = AsyncMock, side_effect = _visible_text_label),
             patch.object(test_bot, "web_click", new_callable = AsyncMock),
             patch.object(test_bot, "page_layout_summary", new_callable = AsyncMock, return_value = ""),
             patch.object(test_bot, "web_sleep", new_callable = AsyncMock),
@@ -1124,6 +1134,120 @@ class TestRedesignedCategoryDialog:
         assert clicked == ["Familie, Kind & Baby", "Baby- & Kinderkleidung", "Strickjacken", "Übernehmen"]
         assert show_all_categories
         mock_find.assert_not_awaited()
+
+    def test_platform_attribute_extends_category_to_dialog_sublevel(self) -> None:
+        """A downloaded game keeps "161/227/nintendo"; its platform attribute selects the new dialog level."""
+        categories = {
+            "Elektronik > Videospiele > Nintendo > Nintendo Switch": "161/227/nintendo/nintendo_switch_1",
+            "Elektronik > Videospiele > Nintendo Spiele": "161/227/nintendo",
+        }
+        assert _category_with_dialog_sublevel(
+            "161/227/nintendo", categories, {"condition_s": "alright", "platform_s": "nintendo_switch_1", "art_s": "nintendo"}
+        ) == "161/227/nintendo/nintendo_switch_1"
+        assert _category_with_dialog_sublevel("161/227/nintendo", categories, {"art_s": "nintendo"}) == "161/227/nintendo"
+        assert _category_with_dialog_sublevel("161/227/nintendo", categories, {"platform_s": "unknown"}) == "161/227/nintendo"
+        assert _category_with_dialog_sublevel("161/227/nintendo", categories, None) == "161/227/nintendo"
+
+    def test_bundled_platform_paths_resolve_to_dialog_labels(self) -> None:
+        """The bundled mapping names every level of the redesigned video game dialog."""
+        categories:dict[str, str] = dicts.load_dict_from_module(resources, "categories.yaml", "")
+        labels = _category_dialog_label_options("161/227/nintendo/nintendo_switch_1", categories)
+        assert labels[0] == ["Elektronik"]
+        assert labels[1] == ["Videospiele"]
+        assert "Nintendo" in labels[2]
+        assert labels[3] == ["Nintendo Switch"]
+        assert _category_label_match_score("Nintendo", "Nintendo") == 3
+        assert "Nintendo" in _category_dialog_label_options("161/279/nintendo", categories)[2]
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_folder_without_selected_leaf_reports_offered_sublevel(self, test_bot:KleinanzeigenBot) -> None:
+        """A path ending at a folder (no aria-pressed leaf) fails with the next level's choices, not a vague error."""
+        test_bot.categories = {"Elektronik > Videospiele > Nintendo > Nintendo Switch": "161/227/nintendo/nintendo_switch_1"}
+        labels = {"Elektronik": "Elektronik", "Videospiele": "Videospiele", "Nintendo": "Nintendo", "Switch": "Nintendo Switch"}
+        buttons = {key: MagicMock(click = AsyncMock(), label = label) for key, label in labels.items()}
+        level = 0
+
+        async def advance() -> None:
+            nonlocal level
+            level += 1
+
+        for key in ("Elektronik", "Videospiele", "Nintendo"):
+            buttons[key].click = AsyncMock(side_effect = advance)
+
+        async def find_all(selector_type:By, selector_value:str, **_kwargs:Any) -> list[Element]:
+            if selector_value == 'dialog[open] li > button[aria-pressed="true"]':
+                return []
+            if selector_value == "dialog[open] li > button":
+                return [[buttons["Elektronik"]], [buttons["Videospiele"]], [buttons["Nintendo"]], [buttons["Switch"]]][level]
+            raise AssertionError(f"Unexpected selector: {selector_value}")
+
+        async def label_of(_web:Any, button:Element) -> str:
+            return str(button.label)
+
+        with (
+            patch.object(test_bot, "web_find_all", new_callable = AsyncMock, side_effect = find_all),
+            patch.object(publishing_form, "_category_choice_label", new_callable = AsyncMock, side_effect = label_of),
+            patch.object(test_bot, "web_sleep", new_callable = AsyncMock),
+            pytest.raises(CategoryResolutionError, match = "requires a further level.*Nintendo Switch"),
+        ):
+            await _set_category_in_dialog(test_bot, category = "161/227/nintendo", dialog_selector = "dialog[open]")
+
+        buttons["Switch"].click.assert_not_awaited()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_root_is_reopened_from_breadcrumb_in_suggested_branch(self, test_bot:KleinanzeigenBot) -> None:
+        """The dialog may reopen inside a suggested branch; "Alle Kategorien" then leads back to the root."""
+        root = MagicMock(label = "Alle Kategorien", click = AsyncMock())
+        sibling = MagicMock(label = "Konsolen", click = AsyncMock())
+        wanted = MagicMock(label = "Elektronik", click = AsyncMock())
+        at_root = False
+
+        async def go_root() -> None:
+            nonlocal at_root
+            at_root = True
+
+        root.click = AsyncMock(side_effect = go_root)
+
+        async def find_all(selector_type:By, selector_value:str, **_kwargs:Any) -> list[Element]:
+            return [wanted] if at_root else [root, sibling]
+
+        async def label_of(_web:Any, button:Element) -> str:
+            return str(button.label)
+
+        with (
+            patch.object(test_bot, "web_find_all", new_callable = AsyncMock, side_effect = find_all),
+            patch.object(publishing_form, "_category_choice_label", new_callable = AsyncMock, side_effect = label_of),
+            patch.object(test_bot, "web_sleep", new_callable = AsyncMock),
+        ):
+            assert await _click_category_dialog_level(test_bot, "dialog[open]", "161/227", 0, ["Elektronik"]) == "Elektronik"
+
+        root.click.assert_awaited_once()
+        sibling.click.assert_not_awaited()
+        wanted.click.assert_awaited_once()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_platform_attribute_set_by_dialog_is_not_set_again(
+        self, test_bot:KleinanzeigenBot, base_ad_config:dict[str, Any],
+    ) -> None:
+        """After the dialog selected "Nintendo Switch", platform_s is already in the form and must not be re-entered."""
+        ad_cfg = Ad.model_validate(base_ad_config | {"special_attributes": {"platform_s": "nintendo_switch_1"}})
+        probes:list[str] = []
+
+        async def probe(selector_type:By, selector_value:str, **_kwargs:Any) -> Element | None:
+            probes.append(selector_value)
+            return MagicMock(spec = Element)
+
+        with (
+            patch.object(test_bot, "web_probe", new_callable = AsyncMock, side_effect = probe),
+            patch.object(test_bot, "web_find_all", new_callable = AsyncMock) as mock_find_all,
+        ):
+            await set_special_attributes(test_bot, ad_cfg)
+
+        assert probes == ["input[type='hidden'][name$='.platform]'][value=\"nintendo_switch_1\"]"]
+        mock_find_all.assert_not_awaited()
 
 
 class TestImageUploadProcessedMarkerFallback:

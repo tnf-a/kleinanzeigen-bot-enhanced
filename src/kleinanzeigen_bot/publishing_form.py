@@ -46,6 +46,8 @@ _OPEN_DIALOG_SELECTORS:Final[tuple[str, ...]] = (
     '[role="dialog"]:not([aria-hidden="true"])',
 )
 _SHIPPING_SIZE_RADIO_VALUES:Final[tuple[str, ...]] = ("SMALL", "MEDIUM", "LARGE")
+# Attributes whose value the category dialog asks for as an extra path level (see _category_with_dialog_sublevel).
+_CATEGORY_SUBLEVEL_ATTRIBUTES:Final[frozenset[str]] = frozenset({"platform"})
 _BRAND_COMBOBOX_LABELS:Final[dict[str, str]] = {
     "c_a": "C&A",
     "h_m": "H&M",
@@ -157,6 +159,61 @@ def _category_label_match_score(label:str, candidate:str) -> int:
     return 0
 
 
+async def _category_choice_label(web:WebScrapingMixin, button:Element) -> str:
+    """Return a category dialog choice name without screen-reader suffixes such as ", öffnet Unterkategorien"."""
+    label = str(await web.web_apply(button, page_scripts.function("category_choice_label")))
+    return label or await web.extract_visible_text(button)
+
+
+async def _raise_if_category_needs_sublevel(
+    web:WebScrapingMixin,
+    dialog_selector:str,
+    category:str,
+    clicked_labels:Sequence[str],
+) -> None:
+    """Fail with an actionable message when the last configured level only opened further subcategories.
+
+    A leaf stays in the visible list after it is clicked; a folder is replaced by its children. So if the
+    last clicked label is gone and other choices are shown, the configured path ends at a folder.
+    """
+    try:
+        buttons = await web.web_find_all(By.CSS_SELECTOR, f"{dialog_selector} li > button", timeout = web.timeout("quick_dom"))
+    except TimeoutError:
+        return
+    labels = [await _category_choice_label(web, button) for button in buttons]
+    if not clicked_labels or clicked_labels[-1] in labels:
+        return
+    skipped = {*clicked_labels, "Alle Kategorien", "All categories"}
+    offered = [label for label in labels if label and label not in skipped]
+    if offered:
+        raise CategoryResolutionError(
+            _("Category '%(category)s' requires a further level in the category dialog. Offered choices: %(offered)s. "
+              "Use a longer category path from categories.yaml or set the matching special attribute (e.g. 'platform_s').")
+            % {"category": category, "offered": ", ".join(offered)}
+        )
+
+
+def _category_with_dialog_sublevel(
+    category:str,
+    categories:Mapping[str, str],
+    special_attributes:Mapping[str, str] | None,
+) -> str:
+    """Extend a category path by a sub-level that the dialog asks for but the ad stores as an attribute.
+
+    Kleinanzeigen splits e.g. "Elektronik > Videospiele > Nintendo" into platforms ("Nintendo Switch", ...).
+    The category ID stays ``161/227/nintendo`` and the platform is stored as attribute ``platform_s``, so a
+    downloaded ad keeps the three-level path. Append the attribute value when that longer path is known.
+    """
+    if not special_attributes:
+        return category
+    known_paths = set(categories.values())
+    for key, value in special_attributes.items():
+        normalized_key = re.sub(r"_[a-z]+$", "", key).rsplit(".", maxsplit = 1)[-1]
+        if normalized_key in _CATEGORY_SUBLEVEL_ATTRIBUTES and (candidate := f"{category}/{value}") in known_paths:
+            return candidate
+    return category
+
+
 async def _probe_category_dialog(web:WebScrapingMixin) -> str | None:
     """Return the selector for the redesigned category dialog, if it is open."""
     for dialog_selector in _OPEN_DIALOG_SELECTORS:
@@ -189,7 +246,7 @@ async def _click_category_dialog_level(
 
         choices:list[tuple[Element, str, int]] = []
         for button in buttons:
-            label = await web.extract_visible_text(button)
+            label = await _category_choice_label(web, button)
             if label:
                 score = max(
                     (_category_label_match_score(label, candidate) for candidate in label_candidates),
@@ -199,15 +256,15 @@ async def _click_category_dialog_level(
         return choices
 
     offered = await read_offered()
-    if (
-        depth == 0
-        and len(offered) == 1
-        and offered[0][2] == 0
-        and _category_label_tokens(offered[0][1]) in {("alle", "kategorien"), ("all", "categories")}
-    ):
-        # Some sessions initially show only a generic entry point. Open it
-        # once, then resolve the requested root against the newly visible list.
-        await offered[0][0].click()
+    all_categories = [
+        button for button, label, _score in offered
+        if _category_label_tokens(label) in {("alle", "kategorien"), ("all", "categories")}
+    ]
+    if depth == 0 and len(all_categories) == 1 and not any(score > 0 for _button, _label, score in offered):
+        # Some sessions show only a generic entry point, others reopen the dialog inside
+        # a suggested branch with "Alle Kategorien" as breadcrumb. Go to the root once,
+        # then resolve the requested root against the newly visible list.
+        await all_categories[0].click()
         await web.web_sleep()
         offered = await read_offered()
 
@@ -233,20 +290,23 @@ async def _set_category_in_dialog(
     category:str,
     dialog_selector:str,
     product_title:str | None = None,
+    special_attributes:Mapping[str, str] | None = None,
 ) -> None:
     """Select a configured category path in Kleinanzeigen's redesigned dialog."""
     categories = getattr(web, "categories", {})
     if not isinstance(categories, Mapping):
         categories = {}
+    category = _category_with_dialog_sublevel(category, categories, special_attributes)
     label_options = _category_dialog_label_options(category, categories, product_title = product_title)
     if not label_options or any(not candidates for candidates in label_options):
         raise CategoryResolutionError(
             _("Category dialog cannot resolve the configured category path '%s' to visible labels.") % category
         )
 
-    selected_leaf = ""
+    clicked_labels:list[str] = []
     for depth, candidates in enumerate(label_options):
-        selected_leaf = await _click_category_dialog_level(web, dialog_selector, category, depth, candidates)
+        clicked_labels.append(await _click_category_dialog_level(web, dialog_selector, category, depth, candidates))
+    selected_leaf = clicked_labels[-1]
 
     # The dialog uses aria-pressed for its selected leaf. Fail closed if the
     # category click did not actually select a leaf before applying it.
@@ -258,8 +318,10 @@ async def _set_category_in_dialog(
         )
     except TimeoutError:
         selected_buttons = []
-    selected_labels = {await web.extract_visible_text(button) for button in selected_buttons}
+    selected_labels = {await _category_choice_label(web, button) for button in selected_buttons}
     if selected_leaf not in selected_labels:
+        if not selected_labels:
+            await _raise_if_category_needs_sublevel(web, dialog_selector, category, clicked_labels)
         raise CategoryResolutionError(
             _("Category dialog did not select the requested leaf '%s'.") % selected_leaf
         )
@@ -287,6 +349,7 @@ async def set_category(
     category:str | None,
     ad_file:str,
     product_title:str | None = None,
+    special_attributes:Mapping[str, str] | None = None,
 ) -> None:
     """Set or verify the ad category on the publishing form.
 
@@ -331,6 +394,7 @@ async def set_category(
                 category = category,
                 dialog_selector = dialog_selector,
                 product_title = product_title,
+                special_attributes = special_attributes,
             )
             return
 
@@ -1506,6 +1570,14 @@ async def set_special_attributes(web:WebScrapingMixin, ad_cfg:Ad) -> None:
             LOG.info("Condition dialog not available, falling back to generic attribute handler for [%s]...", special_attribute_key)
             special_attribute_value_str = normalize_condition(special_attribute_value_str)[0]
 
+        if normalized_special_attribute_key in _CATEGORY_SUBLEVEL_ATTRIBUTES and await web.web_probe(
+            By.CSS_SELECTOR,
+            f"input[type='hidden'][name$='.{normalized_special_attribute_key}]'][value={json.dumps(special_attribute_value_str)}]",
+            timeout = web.timeout("quick_dom"),
+        ):
+            LOG.debug("Special attribute [%s] already set by the category dialog", special_attribute_key)
+            continue
+
         LOG.debug("Setting special attribute [%s] to [%s]...", special_attribute_key, special_attribute_value_str)
         special_attr_xpath = _build_special_attribute_xpath(normalized_special_attribute_key, special_attribute_key)
 
@@ -1574,7 +1646,13 @@ async def fill_ad_form(
     #############################
     # set category (before title to avoid form reset clearing title)
     #############################
-    await set_category(web, category = ad_cfg.category, ad_file = ad_file, product_title = ad_cfg.title)
+    await set_category(
+        web,
+        category = ad_cfg.category,
+        ad_file = ad_file,
+        product_title = ad_cfg.title,
+        special_attributes = ad_cfg.special_attributes,
+    )
     await web.web_sleep()  # wait for category-dependent fields to render before setting attributes
 
     #############################
