@@ -1175,11 +1175,13 @@ class TestRedesignedCategoryDialog:
         for key in ("Elektronik", "Videospiele", "Nintendo"):
             buttons[key].click = AsyncMock(side_effect = advance)
 
+        levels:list[list[Element]] = [[buttons["Elektronik"]], [buttons["Videospiele"]], [buttons["Nintendo"]], [buttons["Switch"]]]
+
         async def find_all(selector_type:By, selector_value:str, **_kwargs:Any) -> list[Element]:
             if selector_value == 'dialog[open] li > button[aria-pressed="true"]':
                 return []
             if selector_value == "dialog[open] li > button":
-                return [[buttons["Elektronik"]], [buttons["Videospiele"]], [buttons["Nintendo"]], [buttons["Switch"]]][level]
+                return levels[level]
             raise AssertionError(f"Unexpected selector: {selector_value}")
 
         async def label_of(_web:Any, button:Element) -> str:
